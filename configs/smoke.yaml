@@ -1,0 +1,41 @@
+# Tiny configuration used by CI and `make smoke` to exercise the whole pipeline in ~2 minutes on CPU.
+# It runs on SYNTHETIC CICIDS-schema data, so the resulting metrics are NOT a benchmark.
+_base_: default.yaml
+
+device: cpu
+
+paths:
+  raw_dir: data/synthetic
+  artifacts: artifacts_smoke
+  reports: reports_smoke
+
+data:
+  max_train_benign: 8000
+  max_train_per_attack_class: 3000
+  rare_class_max_train: 1500
+  demo_sample_size: 100
+  synthetic:
+    n_rows: 24000
+    seed: 7
+    n_files: 2
+
+vae:
+  epochs: 8
+  batch_size: 512
+  beta_warmup_epochs: 3
+  patience: 3
+
+gan:
+  iterations: 600
+  batch_size: 32
+  n_critic: 3
+  min_real_samples: 15
+  target_per_class: 600
+  fidelity_max_samples: 600
+
+snn:
+  hidden: [96, 48]
+  num_steps: 10
+  epochs: 6
+  batch_size: 512
+  patience: 3

@@ -1,0 +1,49 @@
+# docker compose up --build
+#   API        http://localhost:8000/docs
+#   Dashboard  http://localhost:8501
+#   MLflow     http://localhost:5000   (profile "tracking": docker compose --profile tracking up)
+#
+# Train on the host first so ./artifacts exists:  nids run-all
+x-app: &app
+  build: .
+  image: hybrid-nids:latest
+  volumes:
+    - ./artifacts:/app/artifacts:ro
+    - ./configs:/app/configs:ro
+  environment:
+    NIDS_CONFIG: configs/default.yaml
+    NIDS_SNN_TAG: snn
+
+services:
+  api:
+    <<: *app
+    ports: ["8000:8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if b'\"model_loaded\":true' in urllib.request.urlopen('http://localhost:8000/health').read() else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  dashboard:
+    <<: *app
+    command: ["streamlit", "run", "src/nids/dashboard/app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+    working_dir: /app
+    volumes:
+      - ./artifacts:/app/artifacts:ro
+      - ./configs:/app/configs:ro
+      - ./src:/app/src:ro
+    environment:
+      NIDS_CONFIG: configs/default.yaml
+      API_URL: http://api:8000
+    ports: ["8501:8501"]
+    depends_on:
+      api:
+        condition: service_healthy
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    profiles: ["tracking"]
+    command: mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri sqlite:///mlflow/mlflow.db --default-artifact-root /mlflow/artifacts
+    volumes:
+      - ./mlflow-data:/mlflow
+    ports: ["5000:5000"]

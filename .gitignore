@@ -1,0 +1,60 @@
+# ---- Virtual environments / installs ----
+sec/
+.venv/
+venv/
+env/
+ENV/
+.conda/
+node_modules/
+
+# ---- Secrets and local config (never commit) ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+.streamlit/secrets.toml
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+pip-wheel-metadata/
+
+# ---- Test / lint / type caches ----
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# ---- Notebooks / editors / OS ----
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- Data and generated artifacts (never commit raw datasets or trained weights) ----
+data/raw/
+data/synthetic/
+artifacts/
+artifacts_smoke/
+reports_smoke/
+*.pt
+*.pth
+*.npz
+
+# ---- Experiment tracking ----
+mlruns/
+mlartifacts/
+mlflow.db
+mlflow-data/
+wandb/

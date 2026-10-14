@@ -1,0 +1,96 @@
+# Hybrid NIDS - default configuration (tuned for CICIDS2017 on a ~4 GB GPU).
+# Override any value by creating a new YAML with `_base_: default.yaml`
+# (see configs/smoke.yaml) and passing it with `nids --config <file> ...`.
+
+seed: 42
+device: auto            # auto | cpu | cuda
+
+paths:
+  raw_dir: data/raw/cicids2017   # folder containing the CICIDS2017 CSVs (MachineLearningCVE or TrafficLabelling)
+  artifacts: artifacts           # models, preprocessor, processed arrays
+  reports: reports               # metrics.json + figures
+
+data:
+  label_column: Label
+  # Identifier-like columns that would let a model memorise hosts/time instead of behaviour.
+  drop_columns: ["Flow ID", "Source IP", "Source Port", "Destination IP", "Timestamp", "SimillarHTTP", "Unnamed: 0"]
+  drop_destination_port: true    # port is a strong shortcut for PortScan/Patator; drop to test behavioural signal
+  drop_duplicates: true          # CICIDS2017 has many exact duplicate flows -> leakage across splits if kept
+  label_grouping: family         # family (9 classes) | raw (15 classes)
+  min_class_samples: 10          # classes with fewer total flows are dropped (cannot be split three ways)
+  val_size: 0.15
+  test_size: 0.15
+  # Caps apply to the TRAIN split only. Validation/test keep the natural class prevalence so that
+  # false-positive-rate and alert-volume numbers mean something.
+  max_train_benign: 300000
+  max_train_per_attack_class: 60000
+  rare_class_max_train: 5000     # attack classes with fewer train flows than this are "rare" (GAN targets)
+  demo_sample_size: 500          # raw test flows exported for the dashboard replay
+  synthetic:                     # only used by `nids synth-data` (CI / smoke tests, NOT a benchmark)
+    n_rows: 60000
+    seed: 7
+    n_files: 2
+
+vae:
+  hidden: [128, 64]
+  latent_dim: 16
+  epochs: 40
+  batch_size: 1024
+  lr: 0.001
+  beta: 0.01                     # KL weight after warm-up. Small because min-max-scaled flow features have low
+                                 # total variance; a large beta collapses the posterior (check active_latent_dims)
+  beta_warmup_epochs: 8
+  patience: 6                    # early stopping on benign validation loss
+  latent_weight: 0.3             # weight of latent-distance z-score in the combined anomaly score
+  anomaly_floor_q: 0.95          # benign-validation quantile mapped to anomaly score 0
+  anomaly_ceil_q: 0.999          # benign-validation quantile mapped to anomaly score 1
+
+gan:
+  noise_dim: 64
+  embed_dim: 16
+  g_hidden: [128, 256, 128]
+  d_hidden: [256, 128]
+  iterations: 8000
+  batch_size: 64
+  n_critic: 5
+  lr: 0.0001
+  gp_lambda: 10.0
+  min_real_samples: 20           # rare classes with fewer real train flows are skipped (a GAN would memorise them)
+  target_per_class: 3000         # augment each rare class up to this many train samples ...
+  max_synth_per_real: 20         # ... but never more than this many synthetic samples per real one
+  fidelity_max_samples: 2000
+
+snn:
+  hidden: [256, 128]
+  num_steps: 20                  # simulation time steps per flow
+  beta: 0.9                      # membrane decay
+  learn_beta: true
+  encoding: direct               # direct: layer 1 turns analog features into spikes (accurate, standard practice)
+                                 # rate: Bernoulli spike trains at the input (pure event-driven input, noisier -> lower F1)
+  dropout: 0.1
+  epochs: 30
+  batch_size: 1024
+  lr: 0.002
+  weight_decay: 0.00001
+  class_weighting: sqrt_inv      # sqrt_inv | none
+  rate_reg: 1.0                  # weight of the firing-rate penalty (hinge above rate_target): sparser spikes = cheaper
+                                 # edge inference. Watch 'rates' in the training log; a dead layer means lower it.
+  rate_target: 0.05              # mean firing rate per hidden layer below which no penalty applies
+  rate_reg_warmup_epochs: 4      # penalty ramps up linearly over these epochs
+  patience: 6                    # early stopping on validation macro-F1
+  use_gan_augmentation: true
+  eval_seed: 1234                # fixed RNG seed for stochastic rate coding at inference
+
+fusion:
+  anomaly_weight: 0.8            # how much the VAE can raise risk on its own (noisy-OR)
+  unknown_anomaly_threshold: 0.5 # classifier says Benign but anomaly score >= this -> "Unknown-Anomaly"
+  benign_label: Benign
+  target_fpr_block: 0.005        # benign flows wrongly blocked (validation) -> block threshold
+  target_fpr_monitor: 0.03       # benign flows sent to analyst (validation) -> monitor threshold
+  min_block_threshold: 0.5
+  min_monitor_threshold: 0.2
+
+tracking:
+  enabled: false                 # set true (and `pip install mlflow`) to log runs
+  tracking_uri: sqlite:///mlflow.db   # local DB (MLflow 3 deprecates the file store); or http://localhost:5000
+  experiment: hybrid-nids
