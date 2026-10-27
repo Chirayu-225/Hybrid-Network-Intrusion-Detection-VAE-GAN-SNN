@@ -11,6 +11,10 @@ zero-day case this system exists for. `w < 1` stops the (noisier) anomaly signal
 
 Actions come from two thresholds calibrated on the natural-prevalence VALIDATION split so that the benign
 false-positive rates at "block" and at "monitor" hit configured targets. Nothing is tuned on test data.
+
+The monitor target is calibrated on the FINAL action, not on the risk score alone. A flow the classifier calls
+Benign but the VAE scores >= `unknown_anomaly_threshold` is always sent to monitor, whatever its risk; those
+benign flows are charged to the monitor budget first, and the risk threshold gets whatever budget is left.
 """
 
 from __future__ import annotations
@@ -21,7 +25,9 @@ from typing import Any
 
 import numpy as np
 
-from nids.utils import load_json, save_json
+from nids.utils import get_logger, load_json, save_json
+
+log = get_logger("nids.fusion")
 
 UNKNOWN = "Unknown-Anomaly"
 ACTIONS = ("allow", "monitor", "block")
@@ -45,11 +51,15 @@ class RiskEngine:
         p_attack = 1.0 - probs[:, self.benign_idx]
         return 1.0 - (1.0 - p_attack) * (1.0 - self.w * anomaly)
 
+    def unknown_mask(self, probs: np.ndarray, anomaly: np.ndarray) -> np.ndarray:
+        """Classifier says Benign, VAE says anomalous -> labelled Unknown-Anomaly and never silently allowed."""
+        return (probs.argmax(axis=1) == self.benign_idx) & (anomaly >= self.unknown_thr)
+
     def fuse(self, probs: np.ndarray, anomaly: np.ndarray) -> dict[str, np.ndarray]:
         risk = self.risk(probs, anomaly)
         pred_idx = probs.argmax(axis=1)
         labels = np.array(self.classes, dtype=object)[pred_idx]
-        unknown = (pred_idx == self.benign_idx) & (anomaly >= self.unknown_thr)
+        unknown = self.unknown_mask(probs, anomaly)
         labels = np.where(unknown, UNKNOWN, labels)
 
         action = np.full(len(risk), "allow", dtype=object)
@@ -67,19 +77,66 @@ class RiskEngine:
         }
 
     # ---- calibration
+    @staticmethod
+    def _monitor_threshold(benign_risk: np.ndarray, forced: np.ndarray, target_fpr: float) -> float | None:
+        """Lowest risk threshold m such that mean(forced | risk >= m) over benign flows stays <= target_fpr.
+
+        `forced` marks benign flows that are reviewed regardless of risk (the Unknown-Anomaly override).
+        Returns None when the forced flows alone already use up the budget.
+        """
+        n = len(benign_risk)
+        budget = int(np.floor(target_fpr * n)) - int(forced.sum())
+        if budget <= 0:
+            return None
+        free = np.sort(benign_risk[~forced])[::-1]  # descending
+        if budget >= len(free):
+            return float(free[-1]) if len(free) else 1.0
+        # strictly above the (budget+1)-th largest free risk -> at most `budget` free flows reach monitor
+        return float(np.nextafter(free[budget], np.inf))
+
     def calibrate(self, probs_val: np.ndarray, anomaly_val: np.ndarray, y_val: np.ndarray, fusion_cfg: dict[str, Any]) -> dict:
-        """Pick thresholds from benign validation flows and store them on the engine."""
+        """Pick thresholds from benign validation flows and store them on the engine.
+
+        `block` is a plain risk quantile (the Unknown override never blocks). `monitor` is chosen so the share of
+        benign flows reaching monitor OR block, including those forced there by the Unknown override, hits
+        `target_fpr_monitor`. The realised rates are measured on the actual `fuse()` actions.
+        """
         risk = self.risk(probs_val, anomaly_val)
-        benign_risk = risk[y_val == self.benign_idx]
-        block = max(float(fusion_cfg["min_block_threshold"]), float(np.quantile(benign_risk, 1.0 - fusion_cfg["target_fpr_block"])))
-        monitor = max(float(fusion_cfg["min_monitor_threshold"]), float(np.quantile(benign_risk, 1.0 - fusion_cfg["target_fpr_monitor"])))
-        self.thresholds = Thresholds(monitor=min(monitor, block), block=block)
+        is_benign = y_val == self.benign_idx
+        benign_risk = risk[is_benign]
+        forced = self.unknown_mask(probs_val, anomaly_val)[is_benign]
+
+        block = max(float(fusion_cfg["min_block_threshold"]),
+                    float(np.quantile(benign_risk, 1.0 - fusion_cfg["target_fpr_block"])))
+        target_monitor = float(fusion_cfg["target_fpr_monitor"])
+        m = self._monitor_threshold(benign_risk, forced, target_monitor)
+        warning = None
+        if m is None:
+            warning = (f"Unknown-Anomaly override alone sends {forced.mean():.2%} of benign validation flows to "
+                       f"monitor, above the {target_monitor:.2%} target. Monitor threshold set to the block threshold; "
+                       "raise fusion.unknown_anomaly_threshold or the monitor target.")
+            log.warning(warning)
+            m = block
+        elif m > block:
+            warning = (f"Block target ({fusion_cfg['target_fpr_block']:.2%}) plus the Unknown-Anomaly override "
+                       f"({forced.mean():.2%}) exceed the {target_monitor:.2%} monitor target; every blocked flow is "
+                       "also reviewed, so the realised monitor rate will be above target.")
+            log.warning(warning)
+        monitor = min(max(float(fusion_cfg["min_monitor_threshold"]), m), block)
+        self.thresholds = Thresholds(monitor=monitor, block=block)
+
+        action = self.fuse(probs_val, anomaly_val)["action"][is_benign]
         realised = {
-            "benign_flows_val": int(len(benign_risk)),
-            "benign_fpr_at_block": float((benign_risk >= self.thresholds.block).mean()),
-            "benign_fpr_at_monitor_or_block": float((benign_risk >= self.thresholds.monitor).mean()),
+            "benign_flows_val": int(is_benign.sum()),
+            "benign_fpr_at_block": float((action == "block").mean()),
+            "benign_fpr_at_monitor_or_block": float((action != "allow").mean()),
+            "benign_unknown_override_rate": float(forced.mean()),
+            "benign_monitor_by_override_only": float((forced & (benign_risk < monitor)).mean()),
         }
-        return {"thresholds": asdict(self.thresholds), "realised_on_validation": realised}
+        result = {"thresholds": asdict(self.thresholds), "realised_on_validation": realised}
+        if warning:
+            result["warning"] = warning
+        return result
 
     # ---- persistence
     def save(self, path: str | Path, extra: dict[str, Any] | None = None) -> None:

@@ -6,6 +6,14 @@ Design decisions (each one is a classic way to inflate IDS results if done the o
 * Splits are stratified and taken at the dataset's natural prevalence. Only the TRAIN split is capped /
   down-sampled, so validation and test false-positive rates and alert volumes are realistic.
 * The scaler, the constant-column filter and the NaN fill values are fitted on the (capped) train split only.
+* Rows with inf/NaN are KEPT. In CICIDS2017 they are mostly zero-duration flows (Flow Bytes/s = x/0), a real
+  and label-correlated traffic pattern. Dropping them in training while imputing them at serve time is
+  train/serve skew: the models never see such flows, so every one of them looks maximally anomalous in
+  production. Instead, each column that is non-finite somewhere in TRAIN gets a 0/1 "[non-finite]"
+  indicator feature, and its non-finite values are imputed in range (+inf -> train finite max,
+  -inf -> train finite min, NaN -> train median). A column that was always finite in train has no
+  indicator; a non-finite value there at serve time is genuinely novel and is mapped far out of range,
+  where the VAE flags it.
 * Features are signed-log1p transformed (flow features span ~10 orders of magnitude, with -1 sentinels) and
   then min-max scaled to [0, 1] using train statistics. Out-of-range values at test/serve time are NOT
   clipped here: for the VAE an out-of-range value is precisely the anomaly signal. The GAN and the SNN
@@ -14,6 +22,7 @@ Design decisions (each one is a classic way to inflate IDS results if done the o
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +42,8 @@ from nids.utils import get_logger, save_json, set_seed
 
 log = get_logger("nids.preprocess")
 
-_BIG = 1e18  # stand-in for +/-inf at inference time; log-scaled it is still finite but far out of range
+_BIG = 1e18  # stand-in for +/-inf in columns never non-finite in train: log-scaled it is finite but far out of range
+FLAG_SUFFIX = " [non-finite]"
 
 
 class MissingFeaturesError(ValueError):
@@ -45,27 +55,69 @@ def signed_log1p(x: np.ndarray) -> np.ndarray:
 
 
 class FlowPreprocessor:
-    """Raw CICFlowMeter features -> float32 matrix in (approximately) [0, 1]. Pure numpy, JSON-serialisable."""
+    """Raw CICFlowMeter features -> float32 matrix in (approximately) [0, 1]. Pure numpy, JSON-serialisable.
 
-    def __init__(self, feature_names: list[str], fill: np.ndarray, lo: np.ndarray, scale: np.ndarray):
+    Output columns: the scaled raw features (`feature_names`, the API's input contract), followed by one 0/1
+    indicator per column in `flag_columns` (see `output_names`).
+    """
+
+    def __init__(
+        self,
+        feature_names: list[str],
+        fill: np.ndarray,
+        lo: np.ndarray,
+        scale: np.ndarray,
+        flag_columns: list[str] | None = None,
+        pos_fill: np.ndarray | None = None,
+        neg_fill: np.ndarray | None = None,
+    ):
         self.feature_names = list(feature_names)
+        n = len(self.feature_names)
         self.fill = np.asarray(fill, dtype=np.float64)
         self.lo = np.asarray(lo, dtype=np.float64)
         self.scale = np.asarray(scale, dtype=np.float64)
+        # Defaults reproduce the pre-indicator behaviour, so older preprocessor.json files still load.
+        self.flag_columns = list(flag_columns or [])
+        self.pos_fill = np.full(n, _BIG) if pos_fill is None else np.asarray(pos_fill, dtype=np.float64)
+        self.neg_fill = np.full(n, -_BIG) if neg_fill is None else np.asarray(neg_fill, dtype=np.float64)
+        self._flag_idx = [self.feature_names.index(c) for c in self.flag_columns]
+
+    @property
+    def output_names(self) -> list[str]:
+        return self.feature_names + [c + FLAG_SUFFIX for c in self.flag_columns]
 
     # ------------------------------------------------------------------ fitting
     @classmethod
     def fit(cls, df: pd.DataFrame) -> FlowPreprocessor:
         names = list(df.columns)
         raw = df.to_numpy(dtype=np.float64)
-        fill = np.nanmedian(raw, axis=0)
-        logged = signed_log1p(raw)
-        lo = logged.min(axis=0)
+        finite = np.isfinite(raw)
+        masked = np.where(finite, raw, np.nan)
+        with warnings.catch_warnings():  # an all-non-finite column yields NaN stats; replaced below
+            warnings.simplefilter("ignore", RuntimeWarning)
+            fill = np.nanmedian(masked, axis=0)
+            fmax = np.nanmax(masked, axis=0)
+            fmin = np.nanmin(masked, axis=0)
+        fill, fmax, fmin = (np.nan_to_num(v, nan=0.0) for v in (fill, fmax, fmin))
+        flagged = ~finite.all(axis=0)
+        flag_columns = [n for n, f in zip(names, flagged) if f]
+        prep = cls(names, fill, np.zeros(len(names)), np.ones(len(names)), flag_columns,
+                   pos_fill=np.where(flagged, fmax, _BIG), neg_fill=np.where(flagged, fmin, -_BIG))
+        logged = signed_log1p(prep._impute(raw)[0])
+        prep.lo = logged.min(axis=0)
         hi = logged.max(axis=0)
-        scale = np.where(hi - lo < 1e-12, 1.0, hi - lo)
-        return cls(names, fill, lo, scale)
+        prep.scale = np.where(hi - prep.lo < 1e-12, 1.0, hi - prep.lo)
+        return prep
 
     # ------------------------------------------------------------------ transform
+    def _impute(self, raw: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Replace NaN / +inf / -inf column-wise; return the imputed matrix and the non-finite mask."""
+        nan, pos, neg = np.isnan(raw), np.isposinf(raw), np.isneginf(raw)
+        out = np.where(nan, self.fill, raw)
+        out = np.where(pos, self.pos_fill, out)
+        out = np.where(neg, self.neg_fill, out)
+        return np.clip(out, -_BIG, _BIG), nan | pos | neg
+
     def transform(self, df: pd.DataFrame) -> np.ndarray:
         frame = df.copy()
         frame.columns = [str(c).strip() for c in frame.columns]
@@ -73,9 +125,11 @@ class FlowPreprocessor:
         if missing:
             raise MissingFeaturesError(f"{len(missing)} required feature(s) missing, e.g. {missing[:5]}")
         raw = frame[self.feature_names].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float64)
-        raw = np.where(np.isnan(raw), self.fill, raw)
-        raw = np.clip(raw, -_BIG, _BIG)  # +/-inf -> huge finite
-        return ((signed_log1p(raw) - self.lo) / self.scale).astype(np.float32)
+        imputed, nonfinite = self._impute(raw)
+        scaled = (signed_log1p(imputed) - self.lo) / self.scale
+        if self._flag_idx:
+            scaled = np.hstack([scaled, nonfinite[:, self._flag_idx].astype(np.float64)])
+        return scaled.astype(np.float32)
 
     # ------------------------------------------------------------------ persistence
     def save(self, path: str | Path) -> None:
@@ -85,6 +139,9 @@ class FlowPreprocessor:
                 "fill": self.fill.tolist(),
                 "lo": self.lo.tolist(),
                 "scale": self.scale.tolist(),
+                "flag_columns": self.flag_columns,
+                "pos_fill": self.pos_fill.tolist(),
+                "neg_fill": self.neg_fill.tolist(),
             },
             path,
         )
@@ -95,7 +152,8 @@ class FlowPreprocessor:
 
         with open(path, encoding="utf-8") as fh:
             blob = json.load(fh)
-        return cls(blob["feature_names"], blob["fill"], blob["lo"], blob["scale"])
+        return cls(blob["feature_names"], blob["fill"], blob["lo"], blob["scale"],
+                   blob.get("flag_columns"), blob.get("pos_fill"), blob.get("neg_fill"))
 
 
 # ---------------------------------------------------------------------- loading / cleaning
@@ -129,16 +187,14 @@ def load_raw(raw_dir: str | Path, label_col: str, drop_columns: list[str]) -> pd
 
 
 def clean(df: pd.DataFrame, cfg: Config) -> tuple[pd.DataFrame, dict[str, int]]:
-    """Drop duplicate/identifier columns, non-finite rows and (optionally) exact duplicate flows."""
+    """Drop duplicate/identifier columns and (optionally) exact duplicate flows. Non-finite rows are kept."""
     stats = {"rows_raw": len(df)}
     drop = list(DUPLICATE_COLUMNS)
     if cfg.data.drop_destination_port:
         drop.append("Destination Port")
     df = df.drop(columns=[c for c in drop if c in df.columns])
     feature_cols = [c for c in df.columns if c != LABEL_RAW]
-    finite = np.isfinite(df[feature_cols].to_numpy()).all(axis=1)
-    df = df[finite]
-    stats["rows_finite"] = len(df)
+    stats["rows_with_nonfinite"] = int((~np.isfinite(df[feature_cols].to_numpy())).any(axis=1).sum())
     if cfg.data.drop_duplicates:
         df = df.drop_duplicates()
     stats["rows_deduplicated"] = len(df)
@@ -225,6 +281,9 @@ def prepare(cfg: Config) -> dict[str, Any]:
     if constant:
         log.info("Removing %d constant column(s): %s", len(constant), constant)
     prep = FlowPreprocessor.fit(train_feats[varying])
+    if prep.flag_columns:
+        log.info("Non-finite values kept with indicator features for %d column(s): %s",
+                 len(prep.flag_columns), prep.flag_columns)
     prep.save(out_dir.parent / "preprocessor.json")
 
     arrays: dict[str, tuple[np.ndarray, np.ndarray]] = {}
@@ -243,8 +302,10 @@ def prepare(cfg: Config) -> dict[str, Any]:
     meta = {
         "classes": classes,
         "benign_index": 0,
-        "feature_names": varying,
-        "n_features": len(varying),
+        "feature_names": varying,  # raw input columns (the serving contract)
+        "model_feature_names": prep.output_names,  # columns of the processed arrays
+        "n_features": len(prep.output_names),
+        "nonfinite_flag_columns": prep.flag_columns,
         "label_grouping": cfg.data.label_grouping,
         "cleaning": clean_stats,
         "dropped_classes": dropped,

@@ -26,7 +26,9 @@ def calibrate(cfg: Config, snn_tag: str = "snn") -> dict:
     anomaly = vae.score(X_val)["score"]
     engine = RiskEngine(meta["classes"], cfg.fusion)
     result = engine.calibrate(probs, anomaly, y_val, cfg.fusion)
-    engine.save(root / snn_tag / "thresholds.json", extra={"calibration": result["realised_on_validation"],
-                                                         "fusion_config": cfg.fusion.to_dict()})
+    extra = {"calibration": result["realised_on_validation"], "fusion_config": cfg.fusion.to_dict()}
+    if "warning" in result:
+        extra["warning"] = result["warning"]
+    engine.save(root / snn_tag / "thresholds.json", extra=extra)
     log.info("Thresholds: %s | realised on validation: %s", result["thresholds"], result["realised_on_validation"])
     return result

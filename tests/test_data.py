@@ -64,6 +64,50 @@ def test_preprocessor_roundtrip_and_robustness(tmp_path):
         again.transform(df.drop(columns=["a"]))
 
 
+def test_nonfinite_seen_in_train_gets_indicator_and_stays_in_range(tmp_path):
+    rng = np.random.default_rng(0)
+    df = pd.DataFrame(rng.lognormal(3, 1, (500, 3)), columns=["dur", "bytes_s", "pkts"])
+    df.loc[:19, "bytes_s"] = np.inf  # zero-duration flows: x / 0
+    df.loc[20:29, "bytes_s"] = np.nan  # 0 / 0
+    prep = FlowPreprocessor.fit(df)
+    assert prep.flag_columns == ["bytes_s"]
+    assert prep.output_names == ["dur", "bytes_s", "pkts", "bytes_s [non-finite]"]
+
+    X = prep.transform(df)
+    assert X.shape == (500, 4) and np.isfinite(X).all()
+    assert X.min() >= -1e-6 and X.max() <= 1 + 1e-6, "train-seen non-finite values must be imputed in range"
+    assert X[:30, 3].tolist() == [1.0] * 30 and X[30:, 3].sum() == 0
+    assert np.isclose(X[:20, 1], 1.0).all()  # +inf -> train finite max
+
+    prep.save(tmp_path / "p.json")
+    again = FlowPreprocessor.load(tmp_path / "p.json")
+    serve = pd.DataFrame({"dur": [5.0], "bytes_s": [np.inf], "pkts": [np.inf]})
+    out = again.transform(serve)
+    assert out[0, 3] == 1.0 and out[0, 1] <= 1 + 1e-6
+    assert out[0, 2] > 1.0, "non-finite in a column that was always finite in train is genuinely novel"
+
+
+def test_legacy_preprocessor_json_still_loads(tmp_path):
+    import json
+
+    path = tmp_path / "old.json"
+    path.write_text(json.dumps({"feature_names": ["a"], "fill": [1.0], "lo": [0.0], "scale": [5.0]}))
+    prep = FlowPreprocessor.load(path)
+    assert prep.flag_columns == [] and prep.transform(pd.DataFrame({"a": [np.inf]}))[0, 0] > 1.0
+
+
+def test_clean_keeps_nonfinite_rows():
+    from nids.config import load_config
+    from nids.data.preprocess import clean
+    from nids.data.schema import LABEL_RAW
+
+    df = generate(3000, seed=1).rename(columns={"Label": LABEL_RAW})
+    n_nonfinite = int((~np.isfinite(df.drop(columns=[LABEL_RAW]).to_numpy(dtype=float))).any(axis=1).sum())
+    out, stats = clean(df, load_config("configs/smoke.yaml"))
+    assert n_nonfinite > 0 and stats["rows_with_nonfinite"] > 0
+    assert (~np.isfinite(out.drop(columns=[LABEL_RAW]).to_numpy(dtype=float))).any(axis=1).sum() > 0
+
+
 def test_preprocessor_tolerates_header_whitespace():
     df = pd.DataFrame({"a": [1.0, 2.0, 3.0], "b": [4.0, 5.0, 6.0]})
     prep = FlowPreprocessor.fit(df)
@@ -93,3 +137,6 @@ def test_prepare_has_no_leakage(trained):
     assert meta["classes"][0] == "Benign"
     # scaler was fitted on train: train features lie inside [0, 1]
     assert tr[0].min() >= -1e-6 and tr[0].max() <= 1 + 1e-6
+    # non-finite rows are kept and carried by indicator features (no train/serve skew)
+    assert meta["cleaning"]["rows_with_nonfinite"] > 0 and meta["nonfinite_flag_columns"]
+    assert tr[0].shape[1] == meta["n_features"] == len(meta["feature_names"]) + len(meta["nonfinite_flag_columns"])
