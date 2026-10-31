@@ -142,12 +142,28 @@ def _api_health(url: str) -> bool:
         return False
 
 
+def _json_records(chunk: pd.DataFrame) -> list[dict]:
+    """Records safe for strict JSON: NaN -> null (missing); +/-inf -> "Infinity"/"-Infinity" strings.
+
+    Real CICFlowMeter exports contain inf (Flow Bytes/s = x/0) and `requests` refuses to serialise it. The
+    API's float fields parse these strings back to +/-inf, so the preprocessor sees the same value it
+    would see in local mode (and its [non-finite] indicator fires).
+    """
+    out = chunk.astype(object).where(chunk.notna(), None)
+    records = out.to_dict(orient="records")
+    for rec in records:
+        for k, v in rec.items():
+            if isinstance(v, float) and np.isinf(v):
+                rec[k] = "Infinity" if v > 0 else "-Infinity"
+    return records
+
+
 def _score_via_api(df: pd.DataFrame, url: str) -> tuple[list[dict], float]:
     results, latencies = [], []
     progress = st.progress(0.0, text="Scoring flows...")
     for start in range(0, len(df), BATCH):
         chunk = df.iloc[start:start + BATCH]
-        payload = {"flows": chunk.replace({np.nan: None}).to_dict(orient="records")}
+        payload = {"flows": _json_records(chunk)}
         resp = requests.post(f"{url.rstrip('/')}/predict", json=payload, timeout=60)
         resp.raise_for_status()
         body = resp.json()
@@ -347,7 +363,7 @@ with tab_overview:
     mixc["share"] = mixc["flows"] / mixc["total"]
     order = mixc.groupby(split_col)["total"].first().sort_values(ascending=False).index.tolist()
     stacked = alt.Chart(mixc).mark_bar().encode(
-        y=alt.Y(f"{split_col}:N", sort=order, title=None, axis=alt.Axis(labelLimit=220)),
+        y=alt.Y(f"{split_col}:N", sort=order, title=None, axis=alt.Axis(labelLimit=220, labelOverlap=False)),
         x=alt.X("share:Q", title="Share of class", axis=alt.Axis(format="%"), stack="normalize"),
         color=action_color_scale(alt.Legend(title="Action", orient="top", direction="horizontal")),
         order=alt.Order("action:N", sort="ascending"),
